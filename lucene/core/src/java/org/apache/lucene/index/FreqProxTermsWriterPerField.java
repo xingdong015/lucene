@@ -82,30 +82,46 @@ final class FreqProxTermsWriterPerField extends TermsHashPerField {
   }
 
   void writeProx(int termID, int proxCode) {
+    // 如果该term没有payLoad信息，则把proxCode << 1 追加到stream 1，注意没有payLoad最后一位肯定是0
+    // 当不存在payload信息时，单独存储pos的差值左移一位，这样用最后一位0表示后面没有payload数据。
+    // 如果存在payload数据，则先存储pos差值左移一位 | 1，这样用最后一位1表示后面有payload数据，
+    // 然后再写payload长度，类型是Vint，最后写入payload的数据
     if (payloadAttribute == null) {
       writeVInt(1, proxCode << 1);
     } else {
       BytesRef payload = payloadAttribute.getPayload();
+      // 如果该position的term存在payLoad信息
       if (payload != null && payload.length > 0) {
+        // 注意有payLoad的时候，最后一位肯定是1
         writeVInt(1, (proxCode << 1) | 1);
+        // payLoad的长度
         writeVInt(1, payload.length);
+        // payLoad的内容
         writeBytes(1, payload.bytes, payload.offset, payload.length);
         sawPayloads = true;
       } else {
+        // 如果该 position 的 term 不存在payLoad信息
         writeVInt(1, proxCode << 1);
       }
     }
 
     assert postingsArray == freqProxPostingsArray;
+    // 更新term在当前处理文档中上一次出现的position
     freqProxPostingsArray.lastPositions[termID] = fieldState.position;
   }
 
+  // 有时候，我们对一个Document添加了相同的Field，则在处理时是把这些Field的内容拼起来，
+  // offsetAccum记录的就是当前field在拼接中的偏移量
   void writeOffsets(int termID, int offsetAccum) {
+    // 记录的所有相同Field拼接之后的offset
     final int startOffset = offsetAccum + offsetAttribute.startOffset();
     final int endOffset = offsetAccum + offsetAttribute.endOffset();
     assert startOffset - freqProxPostingsArray.lastOffsets[termID] >= 0;
+    // 差值存储 startOffset
     writeVInt(1, startOffset - freqProxPostingsArray.lastOffsets[termID]);
+    // 这边记录的其实就是term的长度，这里感觉比较冗余，因为在记录term的时候已经记录的term的长度
     writeVInt(1, endOffset - startOffset);
+    // 更新term在当前处理文档中的上一次出现的startOffset
     freqProxPostingsArray.lastOffsets[termID] = startOffset;
   }
 
@@ -114,8 +130,9 @@ final class FreqProxTermsWriterPerField extends TermsHashPerField {
     // First time we're seeing this term since the last
     // flush
     final FreqProxPostingsArray postings = freqProxPostingsArray;
-
+    // 记录term上一次出现的文档
     postings.lastDocIDs[termID] = docID;
+    //是否有频率信息
     if (!hasFreq) {
       assert postings.termFreqs == null;
       postings.lastDocCodes[termID] = docID;
@@ -123,8 +140,10 @@ final class FreqProxTermsWriterPerField extends TermsHashPerField {
     } else {
       postings.lastDocCodes[termID] = docID << 1;
       postings.termFreqs[termID] = getTermFreq();
+      //是否有pos信息
       if (hasProx) {
         writeProx(termID, fieldState.position);
+        //是否有offset信息
         if (hasOffsets) {
           writeOffsets(termID, fieldState.offset);
         }
@@ -141,16 +160,18 @@ final class FreqProxTermsWriterPerField extends TermsHashPerField {
   void addTerm(final int termID, final int docID) {
     final FreqProxPostingsArray postings = freqProxPostingsArray;
     assert !hasFreq || postings.termFreqs[termID] > 0;
-
+    //是否有频率信息
     if (!hasFreq) {
       assert postings.termFreqs == null;
+      // 默认的实现TermFrequencyAttribute 是返回1，如果是自定义实现，则必须在索引选项中加入频率
       if (termFreqAtt.getTermFrequency() != 1) {
         throw new IllegalStateException(
             "field \""
                 + getFieldName()
                 + "\": must index term freq while using custom TermFrequencyAttribute");
       }
-      if (docID != postings.lastDocIDs[termID]) {
+      //当前docId的term出现的上一个docId是否相同?
+      if (docID != postings.lastDocIDs[termID]) {// 上一个文档处理结束
         // New document; now encode docCode for previous doc:
         assert docID > postings.lastDocIDs[termID];
         writeVInt(0, postings.lastDocCodes[termID]);
@@ -158,7 +179,7 @@ final class FreqProxTermsWriterPerField extends TermsHashPerField {
         postings.lastDocIDs[termID] = docID;
         fieldState.uniqueTermCount++;
       }
-    } else if (docID != postings.lastDocIDs[termID]) {
+    } else if (docID != postings.lastDocIDs[termID]) {// 上一个文档处理结束
       assert docID > postings.lastDocIDs[termID]
           : "id: " + docID + " postings ID: " + postings.lastDocIDs[termID] + " termID: " + termID;
       // Term not yet seen in the current doc but previously
@@ -166,34 +187,65 @@ final class FreqProxTermsWriterPerField extends TermsHashPerField {
 
       // Now that we know doc freq for previous doc,
       // write it & lastDocCode
+      // 写入倒排表。
+      // 对于同一个term来说，在某一篇文档中，只有所有该term都被处理结束才会写到倒排表中去，
+      // 否则的话，term在当前文档中的词频frequencies无法正确统计。所以每次处理同一个term时，
+      // 根据它目前所属的文档跟它上一次所属的文档来判断当前的操作是统计词频还是将它写入到倒排表。
+      // 另外包含某个term的所有文档号是用差值存储，该数组用来计算差值。
+
+      //基于压缩存储，如果一个term在一篇文档中的词频只有1，那么文档号跟词频的信息组合存储，否则文档号跟词频分开存储。
       if (1 == postings.termFreqs[termID]) {
+        // 如果频率是1，则和左移一位的文档id一起存储
         writeVInt(0, postings.lastDocCodes[termID] | 1);
       } else {
+        // 如果频率大于1，则先存文档id，注意左移一位的文档id
+        // 如果频率大于1，则先存储docID差值左移一位，
+        // 这样用最后一位0表示后面有单独的频率数据，然后再写频率，类型是Vint。
         writeVInt(0, postings.lastDocCodes[termID]);
         writeVInt(0, postings.termFreqs[termID]);
       }
 
       // Init freq for the current document
+      // 记录在当前文档中出现的频率，默认实现是1
       postings.termFreqs[termID] = getTermFreq();
+      // 更新最大的term的频率
       fieldState.maxTermFrequency =
           Math.max(postings.termFreqs[termID], fieldState.maxTermFrequency);
+      // 文档id编码也是差值存储
       postings.lastDocCodes[termID] = (docID - postings.lastDocIDs[termID]) << 1;
       postings.lastDocIDs[termID] = docID;
+
+      // 是否有position信息
+      // 基于压缩存储，倒排表中的位置(position)信息是一个差值，这个值指的是在同一篇文档中，
+      // 当前term的位置和上一次出现的位置的差值。
+      // 每次获得一个term的位置信息，就马上写入到倒排表中。
+      // 注意的是，实际存储到倒排表时，跟存储文档号一样是一个组合值，
+      // 不过这个编码值是用来描述当前位置的term是否有payload信息。
       if (hasProx) {
         writeProx(termID, fieldState.position);
+        //是否有offset信息
         if (hasOffsets) {
+          // 第一次出现的offset是0
           postings.lastOffsets[termID] = 0;
           writeOffsets(termID, fieldState.offset);
         }
       } else {
         assert !hasOffsets;
       }
+      // 出现的term的个数+1
       fieldState.uniqueTermCount++;
     } else {
+      // 如果不是在处理新的文档，则追加term的信息即可, 用来做词频统计。
+      // 更新term的频率
       postings.termFreqs[termID] = Math.addExact(postings.termFreqs[termID], getTermFreq());
+      // 更新最大的term的频率
       fieldState.maxTermFrequency =
           Math.max(fieldState.maxTermFrequency, postings.termFreqs[termID]);
       if (hasProx) {
+        // position也是差值存储
+        // 基于压缩存储，倒排表中的位置(position)信息是一个差值，这个值指的是在同一篇文档中，当前term的位置和上一次出现的位置的差值。
+        // 每次获得一个term的位置信息，就马上写入到倒排表中。
+        // 注意的是，实际存储到倒排表时，跟存储文档号一样是一个组合值，不过这个编码值是用来描述当前位置的term是否有payload信息。
         writeProx(termID, fieldState.position - postings.lastPositions[termID]);
         if (hasOffsets) {
           writeOffsets(termID, fieldState.offset);
@@ -250,11 +302,15 @@ final class FreqProxTermsWriterPerField extends TermsHashPerField {
       // System.out.println("PA init freqs=" + writeFreqs + " pos=" + writeProx + " offs=" +
       // writeOffsets);
     }
-
+    // 下标是termID,值是termID对应的在当前处理文档中的频率
     int[] termFreqs; // # times this term occurs in the current doc
+    // 下标是termID,值是上一个出现这个term的文档id
     int[] lastDocIDs; // Last docID where this term occurred
+    // 下标是termID,值是上一个出现这个term的文档id的编码：docId << 1
     int[] lastDocCodes; // Code for prior doc
+    // 下标是termID,值是term在当前文档中上一次出现的position
     int[] lastPositions; // Last position where this term occurred
+    // 下标是termID,值是term在当前文档中上一次出现的startOffset（注意这里源码注释不对）
     int[] lastOffsets; // Last endOffset where this term occurred
 
     @Override

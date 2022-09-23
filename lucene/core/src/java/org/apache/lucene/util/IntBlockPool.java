@@ -22,6 +22,9 @@ import java.util.Arrays;
  * A pool for int blocks similar to {@link ByteBlockPool}
  *
  * @lucene.internal
+ *
+ * IntBlockPool在倒排构建中是用来存储每个term在ByteBlockPool中下一个要写入的位置，
+ * 每个term对IntBlockPool都是一个数据源。
  */
 public final class IntBlockPool {
   public static final int INT_BLOCK_SHIFT = 13;

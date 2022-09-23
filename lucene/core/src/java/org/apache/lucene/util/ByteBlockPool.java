@@ -109,10 +109,13 @@ public final class ByteBlockPool implements Accountable {
   /**
    * array of buffers currently used in the pool. Buffers are allocated if needed don't modify this
    * outside of this class.
+   *
+   * 此类中用一个二维数组用来存放term的倒排表数据。
    */
   public byte[][] buffers = new byte[10][];
 
   /** index into the buffers array pointing to the current buffer used as the head */
+  //指向二元buffers的第一元指针, 当前正在向第几个byte[]存放数据
   private int bufferUpto = -1; // Which buffer we are upto
   /** Where we are in head buffer */
   public int byteUpto = BYTE_BLOCK_SIZE;
@@ -120,6 +123,7 @@ public final class ByteBlockPool implements Accountable {
   /** Current head buffer */
   public byte[] buffer;
   /** Current head offset */
+  // buffer在所有buffers的位置（当前buffer在全局的偏移量），(bufferUpto -1)*BYTE_BLOCK_SIZE
   public int byteOffset = -BYTE_BLOCK_SIZE;
 
   private final Allocator allocator;
@@ -187,17 +191,21 @@ public final class ByteBlockPool implements Accountable {
    * will advance the pool to its first buffer immediately.
    */
   public void nextBuffer() {
+    // buffers中已存满buffer了, 需要扩容
     if (1 + bufferUpto == buffers.length) {
       byte[][] newBuffers =
           new byte[ArrayUtil.oversize(buffers.length + 1, NUM_BYTES_OBJECT_REF)][];
+      // 只是拷贝了数组引用，并没有copy数组, 这里体现了ByteBlockPool的优势
+      //第一维度数组对于第二维度数组的引用、
       System.arraycopy(buffers, 0, newBuffers, 0, buffers.length);
       buffers = newBuffers;
     }
+    //产生一个新的buffer, 大小为32kb, 供slice来分配数据
     buffer = buffers[1 + bufferUpto] = allocator.getByteBlock();
-    bufferUpto++;
+    bufferUpto++;//buffers写入位置+1
 
-    byteUpto = 0;
-    byteOffset += BYTE_BLOCK_SIZE;
+    byteUpto = 0;//buffer写入位置
+    byteOffset += BYTE_BLOCK_SIZE;//指针位置初始化
   }
 
   /**
@@ -205,12 +213,21 @@ public final class ByteBlockPool implements Accountable {
    *
    * @see ByteBlockPool#FIRST_LEVEL_SIZE
    */
+  // 从当前buffer中申请一个size大小的slice
   public int newSlice(final int size) {
     if (byteUpto > BYTE_BLOCK_SIZE - size) nextBuffer();
+    // 此时能保证当前buffer一定可以存的下size了
     final int upto = byteUpto;
     byteUpto += size;
+    //赋值为16 调用时 会从byteUpto开始写入，当遇到buffer[pos]位置不为0 时，
+    //会调用allocSlice方法 通过 16&15得到当前 NEXT_LEVEL_ARRAY 中 level
     buffer[byteUpto - 1] = 16;
+    //申请的slice的相对起始位置
     return upto;
+  }
+
+  public static void main(String[] args) {
+    System.out.println(16 & 15);
   }
 
   // Size of each slice.  These arrays should be at most 16
@@ -264,16 +281,21 @@ public final class ByteBlockPool implements Accountable {
 
     // Copy forward the past 3 bytes (which we are about to overwrite with the forwarding address).
     // We actually copy 4 bytes at once since VarHandles make it cheap.
+    // 获取当前upto前面三个字节，也就是哨兵前面的3个字节。这是为了把这部分空间留出来，设置下一个slice的地址。
+    // 注意是小端读取，通过与运算把哨兵字节（upto指向的字节）的过滤了。
     int past3Bytes = ((int) BitUtil.VH_LE_INT.get(slice, upto - 3)) & 0xFFFFFF;
     // Ensure we're not changing the content of `buffer` by setting 4 bytes instead of 3. This
     // should never happen since the next `newSize` bytes must be equal to 0.
     assert buffer[newUpto + 3] == 0;
+    // 把这三个字节写入新slice的开头
     BitUtil.VH_LE_INT.set(buffer, newUpto, past3Bytes);
 
     // Write forwarding address at end of last slice:
+    // 把新slice的地址写入前一个slice腾出三个字节的地方，包括了最后一个哨兵字节，总共地址是4个字节。
     BitUtil.VH_LE_INT.set(slice, upto - 3, offset);
 
     // Write new level:
+    // 当前的slice加入哨兵，可以看到这里把当前的level也存起来了，和前面通过当前level获取新level呼应
     buffer[byteUpto - 1] = (byte) (16 | newLevel);
 
     return ((newUpto + 3) << 8) | (newSize - 3);

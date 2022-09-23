@@ -31,12 +31,17 @@ import org.apache.lucene.util.IntBlockPool;
  * {@link ByteSliceReader} for each term. Terms are first deduplicated in a {@link BytesRefHash}
  * once this is done internal data-structures point to the current offset of each stream that can be
  * written to.
+ *
+ * 构建的核心逻辑在TermsHashPerField中，每个field对应了一个TermsHashPerField，
+ * field的所有倒排数据都存储在TermsHashPerField中。
  */
 abstract class TermsHashPerField implements Comparable<TermsHashPerField> {
   private static final int HASH_INIT_SIZE = 4;
-
+  // 倒排和词向量都会处理term信息，所以倒排和词向量是使用责任链的模式实现，nextPerField就是下一个要处理term信息的组件
   private final TermsHashPerField nextPerField;
+  // 记录term在bytePool中下一个要写入的位置
   private final IntBlockPool intPool;
+  // 记录term和term的相关的倒排信息，倒排信息是以stream的方式写入的
   final ByteBlockPool bytePool;
   // for each term we store an integer per stream that points into the bytePool above
   // the address is updated once data is written to the stream to point to the next free offset
@@ -45,15 +50,21 @@ abstract class TermsHashPerField implements Comparable<TermsHashPerField> {
   // This is initialized in the #addTerm method, either to a brand new per term stream if the term
   // is new or
   // to the addresses where the term stream was written to when we saw it the last time.
+  // intPool中当前使用的buffer
   private int[] termStreamAddressBuffer;
+  // intPool中当前使用的buffer当前定位到的offset
   private int streamAddressOffset;
+  // term的信息分为几个数据源
   private final int streamCount;
+  // 字段名称
   private final String fieldName;
+  // 索引选项：是否记录频率，是否记录position，是否记录offset等
   final IndexOptions indexOptions;
   /* This stores the actual term bytes for postings and offsets into the parent hash in the case that this
    * TermsHashPerField is hashing term vectors.*/
+  // 为term分配唯一id，并且用来判断term是不是第一次出现
   private final BytesRefHash bytesHash;
-
+  // 倒排内存结构构建的辅助类
   ParallelPostingsArray postingsArray;
   private int lastDocID; // only with assert
 
@@ -100,7 +111,7 @@ abstract class TermsHashPerField implements Comparable<TermsHashPerField> {
         postingsArray.byteStarts[termID] + stream * ByteBlockPool.FIRST_LEVEL_SIZE,
         streamAddressBuffer[offsetInAddressBuffer + stream]);
   }
-
+  // 所有的文档都处理完之后，按照term大小对termid进行排序，持久化的时候是按照term顺序处理的
   private int[] sortedTermIDs;
 
   /**
@@ -147,12 +158,16 @@ abstract class TermsHashPerField implements Comparable<TermsHashPerField> {
    */
   private void initStreamSlices(int termID, int docID) throws IOException {
     // Init stream slices
+    // intPool的当前buffer不足，则需要获取下一个buffer。
+    // 这里需要注意的是，这样判断确保了termID对应的intPool中的数据都是相连的，是为了读取的时候考虑的
     if (streamCount + intPool.intUpto > IntBlockPool.INT_BLOCK_SIZE) {
       // not enough space remaining in this buffer -- jump to next buffer and lose this remaining
       // piece
       intPool.nextBuffer();
     }
-
+    //如果 bytePool 中当前buffer无法容纳 streamCount 个level 0的slice，则创建新的 buffer
+    // 这里需要注意的是，这样判断确保了termID对应的bytePool中的所有的stream的第一个slice都是相连的，
+    // 是为了读取的时候考虑的  这里的 2？？？？
     if (ByteBlockPool.BYTE_BLOCK_SIZE - bytePool.byteUpto
         < (2 * streamCount) * ByteBlockPool.FIRST_LEVEL_SIZE) {
       // can we fit at least one byte per stream in the current buffer, if not allocate a new one
@@ -162,16 +177,25 @@ abstract class TermsHashPerField implements Comparable<TermsHashPerField> {
     termStreamAddressBuffer = intPool.buffer;
     streamAddressOffset = intPool.intUpto;
     intPool.intUpto += streamCount; // advance the pool to reserve the N streams for this term
-
+    // 记录termID在intPool中的位置
     postingsArray.addressOffset[termID] = streamAddressOffset + intPool.intOffset;
+
+    //在bytePool中创建 streamCount 个level0 的 slice
+    // 总是预分配两块大小都为5个字节的分片，
+    //两块stream、第一块 存放term的文档号、词频信息，
+    // 第二块存放term的位置、payload、offset信息。
 
     for (int i = 0; i < streamCount; i++) {
       // initialize each stream with a slice we start with ByteBlockPool.FIRST_LEVEL_SIZE)
       // and grow as we need more space. see ByteBlockPool.LEVEL_SIZE_ARRAY
       final int upto = bytePool.newSlice(ByteBlockPool.FIRST_LEVEL_SIZE);
+      // intPool中的buffer记录的是每个stream下一个要写入的位置
       termStreamAddressBuffer[streamAddressOffset + i] = upto + bytePool.byteOffset;
     }
+    // 记录stream在bytePool中的起始位置，这个信息是用来读取时候使用的
     postingsArray.byteStarts[termID] = termStreamAddressBuffer[streamAddressOffset];
+    //处理倒排信息
+    // 第一次出现的term的处理逻辑，在TermsHashPerField是个抽象方法。
     newTerm(termID, docID);
   }
 
@@ -184,19 +208,27 @@ abstract class TermsHashPerField implements Comparable<TermsHashPerField> {
   /**
    * Called once per inverted token. This is the primary entry point (for first TermsHash); postings
    * use this API.
+   *
+   *termBytes是term，docID是term所在的文档id。
    */
   void add(BytesRef termBytes, final int docID) throws IOException {
     assert assertDocId(docID);
     // We are first in the chain so we must "intern" the
     // term text into textStart address
     // Get the text & hash of this term.
+    // bytesHash第一次遇到的term会返回大于等于0的termID
     int termID = bytesHash.add(termBytes);
     // System.out.println("add term=" + termBytesRef.utf8ToString() + " doc=" + docState.docID + "
     // termID=" + termID);
     if (termID >= 0) { // New posting
       // Init stream slices
+      //如果term是第一次出现，则需要走TermsHashPerField#initStreamSlices初始化相关stream，
+      // 然后走FreqProxTermsWriterPerField#newTerm处理倒排信息
+      // term第一次出现，则初始化各个stream的第一个slice
       initStreamSlices(termID, docID);
     } else {
+      //如果term之前出现过，则需要走TermsHashPerField#positionStreamSlice定位到term的写入位置，
+      // 然后走FreqProxTermsWriterPerField#addTerm处理倒排信息。
       termID = positionStreamSlice(termID, docID);
     }
     if (doNextCall) {
@@ -205,26 +237,35 @@ abstract class TermsHashPerField implements Comparable<TermsHashPerField> {
   }
 
   private int positionStreamSlice(int termID, final int docID) throws IOException {
+    //term还原为 (-term) - 1
     termID = (-termID) - 1;
+    // termID在intPool的buffer中的起始位置
     int intStart = postingsArray.addressOffset[termID];
+    // 根据 intStart 获取termID在intPool的buffer和offset
     termStreamAddressBuffer = intPool.buffers[intStart >> IntBlockPool.INT_BLOCK_SHIFT];
     streamAddressOffset = intStart & IntBlockPool.INT_BLOCK_MASK;
+    // 抽象方法，具体新增已有term的信息逻辑在子类实现
     addTerm(termID, docID);
     return termID;
   }
 
   final void writeByte(int stream, byte b) {
+    // streamAddress是stream在intPool中的位置
     int streamAddress = streamAddressOffset + stream;
+    // 从intPool中读取stream下一个要写入的位置
     int upto = termStreamAddressBuffer[streamAddress];
     byte[] bytes = bytePool.buffers[upto >> ByteBlockPool.BYTE_BLOCK_SHIFT];
     assert bytes != null;
     int offset = upto & ByteBlockPool.BYTE_BLOCK_MASK;
+    // 如果碰到了slice的哨兵
     if (bytes[offset] != 0) {
       // End of slice; allocate a new one
+      // 创建下一个slice，并返回写入的地址
       offset = bytePool.allocSlice(bytes, offset);
       bytes = bytePool.buffer;
       termStreamAddressBuffer[streamAddress] = offset + bytePool.byteOffset;
     }
+    // 在slice写入数据
     bytes[offset] = b;
     (termStreamAddressBuffer[streamAddress])++;
   }

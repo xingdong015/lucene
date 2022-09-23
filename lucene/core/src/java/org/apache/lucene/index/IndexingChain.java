@@ -73,9 +73,11 @@ final class IndexingChain implements Accountable {
   // NOTE: I tried using Hash Map<String,PerField>
   // but it was ~2% slower on Wiki and Geonames with Java
   // 1.7.0_25:
+  // 没有采用HashMao来存储PerFiled，随着添加更多的域名,该数组会扩容，数组下标是域名的hashCode
   private PerField[] fieldHash = new PerField[2];
   private int hashMask = 1;
 
+  // 域名的总个数
   private int totalFieldCount;
   private long nextFieldGen;
 
@@ -1188,6 +1190,7 @@ final class IndexingChain implements Accountable {
           // corrupt and should not be flushed to a
           // new segment:
           try {
+            //构建入口: 输入是term和文档Id
             termsHashPerField.add(invertState.termAttribute.getBytesRef(), docID);
           } catch (MaxBytesLengthExceededException e) {
             byte[] prefix = new byte[30];

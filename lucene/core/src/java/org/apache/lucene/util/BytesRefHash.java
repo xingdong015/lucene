@@ -36,6 +36,11 @@ import org.apache.lucene.util.ByteBlockPool.DirectAllocator;
  * total byte storage.
  *
  * @lucene.internal
+ *
+ * BytesRefHash就把它理解成是一个Map。它有两个特点：
+ *
+ * 添加新pair时，只提供key，value是在新增的时候为key分配的id，是从0递增的整型。
+ * 不仅是O(1)时间通过key找value，也是O(1)时间通过value找key。这种实现我们可以借鉴。
  */
 public final class BytesRefHash implements Accountable {
   private static final long BASE_RAM_BYTES =
@@ -48,16 +53,27 @@ public final class BytesRefHash implements Accountable {
 
   // the following fields are needed by comparator,
   // so package private to prevent access$-methods:
+  // 存储所有key值，也就是BytesRef
   final ByteBlockPool pool;
+  // 下标是每个BytesRef的id，值是在pool中的起始位置，通过这个变量实现了O(1)时间通过value找key
+  //根据 bytesRef 找到在 pool中的位置、具体可以查看  {@link #get(BytesRef)} 方法
   int[] bytesStart;
 
+  // 哈希表的最大容量
   private int hashSize;
+  // 超过这个值，需要rehash
   private int hashHalfSize;
+  // 用来获取BytesRef哈希值在ids数组中的下标
   private int hashMask;
+  // 目前哈希表中的总个数
   private int count;
+  // 辅助变量，在清空或者压缩的时候使用，不用关注
   private int lastCount = -1;
+  // 下标是BytesRef哈希值与hashMask的&操作，值是BytesRef的id
   private int[] ids;
+  // bytesStart数组初始化，重置，扩容的辅助类，不用关注
   private final BytesStartArray bytesStartArray;
+  // 统计内存占用，不用关注
   private Counter bytesUsed;
 
   /**
@@ -110,6 +126,7 @@ public final class BytesRefHash implements Accountable {
   public BytesRef get(int bytesID, BytesRef ref) {
     assert bytesStart != null : "bytesStart is null - not initialized";
     assert bytesID < bytesStart.length : "bytesID exceeds byteStart len: " + bytesStart.length;
+    // 从pool的  bytesStart[bytesID] 的位置读取ref，注意会先读长度，再读内容，详见ByteBlockPool
     pool.setBytesRef(ref, bytesStart[bytesID]);
     return ref;
   }
@@ -122,12 +139,19 @@ public final class BytesRefHash implements Accountable {
    * this {@link BytesRefHash} instance.
    *
    * @lucene.internal
+   *
+   * 因为底层数据是当成哈希表使用，所以数组中存在空隙。在数据全部处理完之后，要进行持久化，
+   * 先压缩id数组返回进行下一步的处理：
    */
   public int[] compact() {
     assert bytesStart != null : "bytesStart is null - not initialized";
+    // 如果存在空节点，则upto会停留在空节点的下标，等待填充
     int upto = 0;
+    // 从前往后找
     for (int i = 0; i < hashSize; i++) {
+      // 如果当前的节点非空，则需要判断在其之前是否有空间点可以填充
       if (ids[i] != -1) {
+        // upto < i 说明存在空节点，则把当前节点移动到空节点
         if (upto < i) {
           ids[upto] = ids[i];
           ids[i] = -1;
@@ -146,9 +170,13 @@ public final class BytesRefHash implements Accountable {
    *
    * <p>Note: This is a destructive operation. {@link #clear()} must be called in order to reuse
    * this {@link BytesRefHash} instance.
+   *
+   * 按ByteRef对ids数组排序。在倒排最后要落盘持久化的时候，会先对所有的term排序，
+   * 因为term字典（FST）需要term列表是有序的：
    */
   public int[] sort() {
     final int[] compact = compact();
+    // lucene实现的排序算法的框架，get方法就是获取比较的值来进行比较
     new StringMSBRadixSorter() {
 
       BytesRef scratch = new BytesRef();
@@ -186,14 +214,16 @@ public final class BytesRefHash implements Accountable {
     }
     return Arrays.equals(bytes, offset, offset + length, b.bytes, b.offset, b.offset + b.length);
   }
-
+  //在清空哈希表之后，需要收缩哈希表：
   private boolean shrink(int targetSize) {
     // Cannot use ArrayUtil.shrink because we require power
     // of 2:
     int newSize = hashSize;
+    // 如果现有的容量大于等于8才需要收缩
     while (newSize >= 8 && newSize / 4 > targetSize) {
       newSize /= 2;
     }
+    // 如果需要收缩
     if (newSize != hashSize) {
       bytesUsed.addAndGet(Integer.BYTES * -(hashSize - newSize));
       hashSize = newSize;
@@ -215,6 +245,7 @@ public final class BytesRefHash implements Accountable {
       pool.reset(false, false); // we don't need to 0-fill the buffers
     }
     bytesStart = bytesStartArray.clear();
+    // 收缩成功则ids数组就已经重置了
     if (lastCount != -1 && shrink(lastCount)) {
       // shrink clears the hash entries
       return;
@@ -247,12 +278,15 @@ public final class BytesRefHash implements Accountable {
     assert bytesStart != null : "Bytesstart is null - not initialized";
     final int length = bytes.length;
     // final position
+    // 获取在ids中的下标
     final int hashPos = findHash(bytes);
     int e = ids[hashPos];
-
+    // 如果bytes是新加入的
     if (e == -1) {
       // new entry
+      // 加2是因为长度最多用两个字节存储
       final int len2 = 2 + bytes.length;
+      // 如果当前buffer存不下，则获取下一个buffer
       if (len2 + pool.byteUpto > BYTE_BLOCK_SIZE) {
         if (len2 > BYTE_BLOCK_SIZE) {
           throw new MaxBytesLengthExceededException(
@@ -262,18 +296,22 @@ public final class BytesRefHash implements Accountable {
       }
       final byte[] buffer = pool.buffer;
       final int bufferUpto = pool.byteUpto;
+      // 当前的bytestarts满了，则扩容
       if (count >= bytesStart.length) {
         bytesStart = bytesStartArray.grow();
         assert count < bytesStart.length + 1 : "count: " + count + " len: " + bytesStart.length;
       }
+      // id是递增的
       e = count++;
-
+      // 记录bytes在pool中的offset
       bytesStart[e] = bufferUpto + pool.byteOffset;
 
       // We first encode the length, followed by the
       // bytes. Length is encoded as vInt, but will consume
       // 1 or 2 bytes at most (we reject too-long terms,
       // above).
+      // 先存term长度，再存term.
+      // 小于128用1个字节，否则用2个字节。
       if (length < 128) {
         // 1 byte to store length
         buffer[bufferUpto] = (byte) length;
@@ -287,13 +325,16 @@ public final class BytesRefHash implements Accountable {
         System.arraycopy(bytes.bytes, bytes.offset, buffer, bufferUpto + 2, length);
       }
       assert ids[hashPos] == -1;
+      // 把id存起来
       ids[hashPos] = e;
 
+      // 如果哈希表过半，则rehash
       if (count == hashHalfSize) {
         rehash(2 * hashSize, true);
       }
       return e;
     }
+    // 如果bytes是已经存在的
     return -(e + 1);
   }
 
@@ -303,22 +344,26 @@ public final class BytesRefHash implements Accountable {
    * @param bytes the bytes to look for
    * @return the id of the given bytes, or {@code -1} if there is no mapping for the given bytes.
    */
+  //O(1)时间通过key找value的方法。
   public int find(BytesRef bytes) {
     return ids[findHash(bytes)];
   }
 
   private int findHash(BytesRef bytes) {
     assert bytesStart != null : "bytesStart is null - not initialized";
-
+    // 获取bytes的哈希值
     int code = doHash(bytes.bytes, bytes.offset, bytes.length);
 
     // final position
+    // 获取在ids中的下标
     int hashPos = code & hashMask;
     int e = ids[hashPos];
+    // 如果哈希的下标已经有值了，并且不是bytes，则表示冲突了
     if (e != -1 && !equals(e, bytes)) {
       // Conflict; use linear probe to find an open slot
       // (see LUCENE-5604):
       do {
+        // 冲突了，采用线性探测循环往后找
         code++;
         hashPos = code & hashMask;
         e = ids[hashPos];
@@ -333,6 +378,7 @@ public final class BytesRefHash implements Accountable {
    * the hash for term vectors, because they do not redundantly store the byte[] term directly and
    * instead reference the byte[] term already stored by the postings BytesRefHash. See add(int
    * textStart) in TermsHashPerField.
+   * 没有bytes，但是为offset分配一个id：
    */
   public int addByPoolOffset(int offset) {
     assert bytesStart != null : "Bytesstart is null - not initialized";
