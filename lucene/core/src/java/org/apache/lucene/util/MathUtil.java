@@ -31,6 +31,7 @@ public final class MathUtil {
    */
   public static int log(long x, int base) {
     if (base == 2) {
+      // base == 2 的时候，30倍的速度增加
       // This specialized method is 30x faster.
       return x <= 0 ? 0 : 63 - Long.numberOfLeadingZeros(x);
     } else if (base <= 1) {

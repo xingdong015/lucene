@@ -157,6 +157,16 @@ public abstract class Similarity {
      * @param freq sloppy term frequency, must be finite and positive
      * @param norm encoded normalization factor or {@code 1} if norms are disabled
      * @return document's score
+     *
+     * 针对一些特殊的查询，比如说topK的查询，如果一个block中得分最高的doc都无法进入topk，
+     * 那就可以直接忽略这个block的查询。所以在构建的时候就为每个block筛选了一部分有竞争力的文档，
+     * 至于怎么判断是有竞争力的，
+     * 可以看lucene中打分函数org.apache.lucene.search.similarities.Similarity.SimScorer#score的注释：
+     *
+     * 当norm一样时，freq越大相关性得分越大。
+     * 当freq一样时，norm越大相关性得分越小。
+     * 因此有竞争力的文档就是freq越大，norm越小的文档。
+     * 在构建过程中，使用CompetitiveImpactAccumulator来收集有竞争力的文档的freq和norm对，用Impact对象封装。
      */
     public abstract float score(float freq, long norm);
 

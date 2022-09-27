@@ -31,6 +31,8 @@ import org.apache.lucene.util.FixedBitSet;
  * Class that plugs into term dictionaries, such as {@link Lucene90BlockTreeTermsWriter}, and
  * handles writing postings.
  *
+ * PostingsWriterBase是倒排索引构建的接口。
+ *
  * @see PostingsReaderBase
  * @lucene.experimental
  */
@@ -54,6 +56,8 @@ public abstract class PostingsWriterBase implements Closeable {
    * TermsEnum}! It is already positioned on the term that should be written. This method must set
    * the bit in the provided {@link FixedBitSet} for every docID written. If no docs were written,
    * this method should return null, and the terms dict will skip the term.
+   *
+   * 生成字段中某个term的倒排信息
    */
   public abstract BlockTermState writeTerm(
       BytesRef term, TermsEnum termsEnum, FixedBitSet docsSeen, NormsProducer norms)
@@ -64,6 +68,8 @@ public abstract class PostingsWriterBase implements Closeable {
    * encoded according to latest term. Usually elements in {@code longs} are file pointers, so each
    * one always increases when a new term is consumed. {@code out} is used to write generic bytes,
    * which are not monotonic.
+   *
+   * 在构建term词典索引文件的时候使用
    */
   public abstract void encodeTerm(
       DataOutput out, FieldInfo fieldInfo, BlockTermState state, boolean absolute)

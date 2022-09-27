@@ -104,6 +104,7 @@ import org.apache.lucene.util.fst.Util;
  * <p>The .tim file contains the list of terms in each field along with per-term statistics (such as
  * docfreq) and per-term metadata (typically pointers to the postings list for that term in the
  * inverted index).
+ * tim 文件包含每一个field中的term集合以及每一个term的统计信息。例如 term的词频、以及执行倒排的指针。
  *
  * <p>The .tim is arranged in blocks: with blocks containing a variable number of entries (by
  * default 25-48), where each entry is either a term or a reference to a sub-block.
@@ -347,6 +348,7 @@ public final class Lucene90BlockTreeTermsWriter extends FieldsConsumer {
       lastField = field;
 
       // if (DEBUG) System.out.println("\nBTTW.write seg=" + segment + " field=" + field);
+      //此处 terms 实例为 FreqProxFields#FreqProxTerms 静态内部类对象
       Terms terms = fields.terms(field);
       if (terms == null) {
         continue;

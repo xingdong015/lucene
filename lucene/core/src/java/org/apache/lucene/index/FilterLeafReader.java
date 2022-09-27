@@ -53,6 +53,7 @@ public abstract class FilterLeafReader extends LeafReader {
   }
 
   /** Base class for filtering {@link Fields} implementations. */
+  //过滤器模式、以父类作为属性
   public abstract static class FilterFields extends Fields {
     /** The underlying Fields instance. */
     protected final Fields in;

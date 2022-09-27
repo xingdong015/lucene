@@ -496,6 +496,7 @@ public final class ByteBuffersDataOutput extends DataOutput implements Accountab
 
   private void appendBlock() {
     if (blocks.size() >= MAX_BLOCKS_BEFORE_BLOCK_EXPANSION && blockBits < maxBitsPerBlock) {
+      //每次
       rewriteToBlockSize(blockBits + 1);
       if (blocks.getLast().hasRemaining()) {
         return;
